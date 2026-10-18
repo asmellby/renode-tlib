@@ -318,6 +318,13 @@ uint32_t tlib_get_bus_fault_address()
 
 EXC_INT_0(uint32_t, tlib_get_bus_fault_address)
 
+void tlib_set_bus_fault_address(uint32_t address)
+{
+    cpu->v7m.bus_fault_address = address;
+}
+
+EXC_VOID_1(tlib_set_bus_fault_address, uint32_t, address)
+
 void tlib_raise_precise_bus_fault(uint32_t address)
 {
 
@@ -385,12 +392,26 @@ uint32_t tlib_get_memory_fault_address(bool secure)
 
 EXC_INT_1(uint32_t, tlib_get_memory_fault_address, bool, secure)
 
+void tlib_set_memory_fault_address(uint32_t address, bool secure)
+{
+    cpu->v7m.memory_fault_address[secure] = address;
+}
+
+EXC_VOID_2(tlib_set_memory_fault_address, uint32_t, address, bool, secure)
+
 uint32_t tlib_get_secure_fault_address()
 {
     return cpu->v7m.secure_fault_address;
 }
 
 EXC_INT_0(uint32_t, tlib_get_secure_fault_address)
+
+void tlib_set_secure_fault_address(uint32_t address)
+{
+    cpu->v7m.secure_fault_address = address;
+}
+
+EXC_VOID_1(tlib_set_secure_fault_address, uint32_t, address)
 
 uint32_t tlib_get_secure_fault_status()
 {
