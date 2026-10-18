@@ -3242,9 +3242,18 @@ static inline bool pmsav8_idau_try_get_region(CPUState *env, uint32_t address, i
         return false;
     }
 
-    /* IDAU regions use the SAU region format: the region's NSC flag makes it Secure and Non-secure
-     * callable, otherwise it is Non-secure. */
-    *attribution = (env->idau.rlar[*region_index] & IDAU_SAU_RLAR_NSC) ? SA_SECURE_NSC : SA_NONSECURE;
+    /* An IDAU region attributes its addresses as Non-secure (NS), Secure (S) or Secure and
+     * Non-secure callable (NSC); ARMv8-M Manual: Rule MVCM. The region's NSC flag makes it NSC,
+     * otherwise IDAU_RLAR_SECURE makes it S, otherwise it is NS.
+     */
+    uint32_t rlar = env->idau.rlar[*region_index];
+    if(rlar & IDAU_SAU_RLAR_NSC) {
+        *attribution = SA_SECURE_NSC;
+    } else if(rlar & IDAU_RLAR_SECURE) {
+        *attribution = SA_SECURE;
+    } else {
+        *attribution = SA_NONSECURE;
+    }
     return true;
 }
 

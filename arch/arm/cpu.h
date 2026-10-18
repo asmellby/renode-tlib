@@ -631,6 +631,8 @@ static inline bool attribution_is_secure(enum security_attribution attrib)
 /* There are no such registers in cores, we simply imitate SAU. */
 #define IDAU_SAU_RLAR_ENABLE 0x01
 #define IDAU_SAU_RLAR_NSC    0x02
+/* IDAU regions only: Secure and not Non-secure callable, see pmsav8_idau_try_get_region() */
+#define IDAU_RLAR_SECURE 0x04
 #endif
 
 /* Return the current FPSCR value.  */
