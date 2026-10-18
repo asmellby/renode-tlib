@@ -1573,12 +1573,24 @@ void ccr_write(CPUState *env, uint32_t value, bool is_secure)
         tlib_printf(LOG_LEVEL_WARNING, "Trying to enable instruction cache, but it's not supported");
         value &= ~FIELD_MASK(V7M_CCR, IC);
     }
-    if(!is_secure) {
+    /* TRD is RES0 without Armv8.1-M */
+    if(!arm_feature(env, ARM_FEATURE_V8_1M)) {
         value &= ~FIELD_MASK(V7M_CCR, TRD);
     }
+    /* BFHFNMIGN and TRD are not banked. BFHFNMIGN is read-only from Non-secure state while AIRCR.BFHFNMINS
+     * is 0, and TRD is RAZ/WI from Non-secure state (Armv8-M ARM DDI0553B.r, D1.2.9). Without the Security
+     * Extension the PE is always in Non-secure state and AIRCR.BFHFNMINS is RAO. The common fields are kept
+     * in M_REG_COMMON, which is the Secure bank, so the banked and common fields are merged instead of one
+     * overwriting the other. */
+    uint32_t common = env->v7m.ccr[M_REG_COMMON] & V7M_CCR_NOT_BANKED_FIELDS;
+    if(is_secure) {
+        common = value & V7M_CCR_NOT_BANKED_FIELDS;
+    } else if(!env->v7m.has_trustzone || !tlib_nvic_interrupt_targets_secure(ARMV7M_EXCP_BUS)) {
+        common = (common & ~FIELD_MASK(V7M_CCR, BFHFNMIGN)) | (value & FIELD_MASK(V7M_CCR, BFHFNMIGN));
+    }
 
-    env->v7m.ccr[M_REG_COMMON] = value & V7M_CCR_NOT_BANKED_FIELDS;
     env->v7m.ccr[is_secure] = value & ~V7M_CCR_NOT_BANKED_FIELDS;
+    env->v7m.ccr[M_REG_COMMON] = (env->v7m.ccr[M_REG_COMMON] & ~V7M_CCR_NOT_BANKED_FIELDS) | common;
 }
 
 static inline bool lsp_store_helper(CPUState *env, uint32_t *address, uint32_t val, bool is_secure)
