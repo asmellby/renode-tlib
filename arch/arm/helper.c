@@ -569,6 +569,11 @@ void cpu_reset(CPUState *env)
     bool was_locked_up = env->v7m.locked_up;
     uint32_t number_of_idau_regions = env->number_of_idau_regions;
     uint32_t number_of_sau_regions = env->number_of_sau_regions;
+    /* The IDAU is external to the PE (Armv8-M ARM DDI0553B.r, B10.2, rule RPKG), and so are the system's
+     * implementation-defined attribution exemptions, which the IDAU can report (B10.4, rule MVCM), so a reset
+     * of the PE leaves their configuration to the system that provides them. */
+    IDAUConfiguration idau = env->idau;
+    AttributionExemptions impl_def_attr_exemptions = env->impl_def_attr_exemptions;
 #endif
     memset(env, 0, RESET_OFFSET);
     if(id) {
@@ -578,6 +583,8 @@ void cpu_reset(CPUState *env)
 #ifdef TARGET_PROTO_ARM_M
     env->number_of_idau_regions = number_of_idau_regions;
     env->number_of_sau_regions = number_of_sau_regions;
+    env->idau = idau;
+    env->impl_def_attr_exemptions = impl_def_attr_exemptions;
     if(was_locked_up) {
         /* Armv8-M ARM rule RXQSR: a Cold or Warm reset exits Lockup. */
         tlib_on_lockup_state_change(false);
