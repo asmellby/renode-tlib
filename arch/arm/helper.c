@@ -3138,18 +3138,19 @@ static inline bool pmsav8_is_exempt_from_attribution(uint32_t address, int acces
     return false;
 }
 
-/* `applies_to_whole_page` can be passed NULL in which case the function won't be checking if the
+/* Finds the enabled region of an SAU or IDAU region table that contains `address`. Returns its index,
+ * or -1 if no region or more than one region contains the address.
+ * The attribution the region gives is up to the SAU and IDAU wrappers below.
+ *
+ * `applies_to_whole_page` can be passed NULL in which case the function won't be checking if the
  * returned attribution is the same for the whole page. The same applies if it's value is false from
  * the beginning in which case it will always stay false.
  */
-static inline bool pmsav8_idau_sau_try_get_region(uint32_t address, uint32_t *rbars, uint32_t *rlars, uint32_t regions_count,
-                                                  int *region_index, enum security_attribution *attribution,
-                                                  bool *applies_to_whole_page)
+static inline int pmsav8_idau_sau_find_region(uint32_t address, uint32_t *rbars, uint32_t *rlars, uint32_t regions_count,
+                                              bool *applies_to_whole_page)
 {
     int n;
-    bool hit = false;
-    *region_index = -1;
-    *attribution = SA_SECURE;
+    int hit = -1;
 
     for(n = 0; n < regions_count; n++) {
         if(!(rlars[n] & IDAU_SAU_RLAR_ENABLE)) {
@@ -3159,7 +3160,6 @@ static inline bool pmsav8_idau_sau_try_get_region(uint32_t address, uint32_t *rb
 
         uint32_t base = pmsav8_idau_sau_get_region_base(rbars[n]);
         uint32_t limit = pmsav8_idau_sau_get_region_limit(rlars[n]);
-        bool nsc = rlars[n] & IDAU_SAU_RLAR_NSC;
 
         update__applies_to_whole_page(address, base, limit, applies_to_whole_page);
 
@@ -3171,16 +3171,9 @@ static inline bool pmsav8_idau_sau_try_get_region(uint32_t address, uint32_t *rb
         /* Another region matched?
          *
          * Note that we don't break the loop after finding the first matching region as we need to
-         * make sure it's the only matching region. SAU region isn't valid otherwise and we follow
-         * the same rules for IDAU.
+         * make sure it's the only matching region.
          */
-        if(hit) {
-            /* An address that matches multiple SAU regions is marked as Secure and
-             * not Not-secure callable regardless of the attributes specified by the
-             * regions that matched the address; ARMv8-M Manual: Rule WGDK.
-             */
-            *attribution = SA_SECURE;
-
+        if(hit >= 0) {
             /* Returning after finding the second region is safe even if `applies_to_whole_page` is
              * still true and there is yet another region only partially covering the page.
              *
@@ -3189,21 +3182,9 @@ static inline bool pmsav8_idau_sau_try_get_region(uint32_t address, uint32_t *rb
              * matter as the two matched regions covering the whole page will make the the result
              * the same for every access of this page.
              */
-            return false;
+            return -1;
         }
-
-        hit = true;
-        *region_index = n;
-
-        /* Memory is marked as Secure by default. However, if the address matches a region with
-         * SAU_REGIONn.ENABLE set to 1 and SAU_REGIONn.NSC set to 0, then memory is marked as
-         * Non-secure; ARMv8-M Manual: Rule MPJC.
-         *
-         * This is somewhat contrary to the SAU_RLAR.NSC bit description which states that 0 means
-         * "Region is marked with the Secure attribute and is not Non-secure callable." but the
-         * behavior is confirmed by pseudocode for SecurityCheck in the ARMv8-M Manual.
-         */
-        *attribution = nsc ? SA_SECURE_NSC : SA_NONSECURE;
+        hit = n;
     }
     return hit;
 }
@@ -3218,22 +3199,53 @@ static inline bool pmsav8_sau_try_get_region(CPUState *env, uint32_t address, in
         /* `applies_to_whole_page` is untouched intentionally. This result definitely applies to the
          * whole page but it's only one of a few lookups so let's keep it false if it was false.
          */
+        *region_index = -1;
         return false;
     }
 
-    return pmsav8_idau_sau_try_get_region(address, env->sau.rbar, env->sau.rlar, env->number_of_sau_regions, region_index,
-                                          attribution, applies_to_whole_page);
+    *region_index =
+        pmsav8_idau_sau_find_region(address, env->sau.rbar, env->sau.rlar, env->number_of_sau_regions, applies_to_whole_page);
+    if(*region_index < 0) {
+        /* Memory outside all SAU regions is Secure; ARMv8-M Manual: Rule MPJC. An address that
+         * matches multiple SAU regions is marked as Secure and not Non-secure callable regardless of
+         * the attributes specified by the regions that matched the address; ARMv8-M Manual: Rule WGDK.
+         */
+        *attribution = SA_SECURE;
+        return false;
+    }
+
+    /* If the address matches a region with SAU_REGIONn.ENABLE set to 1 and SAU_REGIONn.NSC set to 0,
+     * then memory is marked as Non-secure; ARMv8-M Manual: Rule MPJC.
+     *
+     * This is somewhat contrary to the SAU_RLAR.NSC bit description which states that 0 means
+     * "Region is marked with the Secure attribute and is not Non-secure callable." but the
+     * behavior is confirmed by pseudocode for SecurityCheck in the ARMv8-M Manual.
+     */
+    *attribution = (env->sau.rlar[*region_index] & IDAU_SAU_RLAR_NSC) ? SA_SECURE_NSC : SA_NONSECURE;
+    return true;
 }
 
-/* The return value is true if a single IDAU region was matched. */
+/* The return value is true if a single IDAU region contains the address, and `attribution` is then that
+ * region's. Otherwise (no region, or several) the IDAU attributes the address as Secure, and the caller
+ * takes the more secure of that and the SAU's attribution. */
 static inline bool pmsav8_idau_try_get_region(CPUState *env, uint32_t address, int *region_index,
                                               enum security_attribution *attribution, bool *applies_to_whole_page)
 {
     //  The function should only be called if IDAU is enabled cause IDAU disabled is indistinguishable from no hit
     tlib_assert(env->idau.enabled);
 
-    return pmsav8_idau_sau_try_get_region(address, env->idau.rbar, env->idau.rlar, env->number_of_idau_regions, region_index,
-                                          attribution, applies_to_whole_page);
+    *region_index =
+        pmsav8_idau_sau_find_region(address, env->idau.rbar, env->idau.rlar, env->number_of_idau_regions, applies_to_whole_page);
+    if(*region_index < 0) {
+        /* An address in no IDAU region, or in more than one, is Secure */
+        *attribution = SA_SECURE;
+        return false;
+    }
+
+    /* IDAU regions use the SAU region format: the region's NSC flag makes it Secure and Non-secure
+     * callable, otherwise it is Non-secure. */
+    *attribution = (env->idau.rlar[*region_index] & IDAU_SAU_RLAR_NSC) ? SA_SECURE_NSC : SA_NONSECURE;
+    return true;
 }
 
 /* `applies_to_whole_page` can be passed NULL in which case the function won't be checking if the
