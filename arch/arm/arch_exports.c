@@ -345,11 +345,7 @@ void tlib_raise_precise_bus_fault(uint32_t address)
         return;
     }
 
-    /* Armv8-M ARM, E2.1.294 MemA_with_priv_security, and rules RDDJJ and
-     * RFLDT: a synchronous BusFault on a normal data access records BFAR,
-     * BFSR.BFARVALID, and BFSR.PRECISERR before exception handling. */
-    cpu->v7m.bus_fault_address = address;
-    cpu->v7m.bus_fault_status |= BUS_FAULT_BFARVALID | BUS_FAULT_PRECISERR;
+    v7m_record_precise_bus_fault(cpu, address);
 
     /* CCR.BFHFNMIGN suppresses the exception if it can be ignored, but not the BFAR/BFSR updates. */
     bool requested_priority_is_negative = is_requested_exception_priority_negative(cpu, cpu->secure);

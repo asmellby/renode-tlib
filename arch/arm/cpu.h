@@ -741,6 +741,14 @@ static inline bool is_requested_exception_priority_negative(CPUState *env, bool 
     /* ARM: IsReqExcPriNeg */
     return env->v7m.exception == ARMV7M_EXCP_NMI || env->v7m.exception == ARMV7M_EXCP_HARD || env->v7m.faultmask[secure];
 }
+
+/* Armv8-M ARM, E2.1.288 MemA_with_priv_security, and rules RDDJJ and RFLDT: a synchronous BusFault on a
+ * normal data access records BFAR, BFSR.BFARVALID and BFSR.PRECISERR before exception handling. */
+static inline void v7m_record_precise_bus_fault(CPUState *env, uint32_t address)
+{
+    env->v7m.bus_fault_address = address;
+    env->v7m.bus_fault_status |= BUS_FAULT_BFARVALID | BUS_FAULT_PRECISERR;
+}
 #endif
 
 static inline bool in_user_mode(CPUState *env)

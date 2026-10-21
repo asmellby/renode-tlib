@@ -968,6 +968,12 @@ static inline int v7m_store_helper(CPUState *env, uint32_t address, uint32_t val
         if(env->v7m.exception_phase_fault == 0) {
             env->v7m.exception_phase_fault = ARMV7M_EXCP_SECURE;
         }
+    } else if(env->exception_index == EXCP_BUS_FAULT) {
+        /* An unprivileged PPB access by VLSTM, outside an exception sequence. get_phys_addr() has recorded
+         * the precise BusFault. */
+        if(env->v7m.exception_phase_fault == 0) {
+            env->v7m.exception_phase_fault = ARMV7M_EXCP_BUS;
+        }
     } else {
         /* An MPU failure during PushStack() is a MemManage stacking fault.
          * get_phys_addr() has already recorded the fault address and access
@@ -1025,6 +1031,10 @@ static inline int v7m_load_helper(CPUState *env, uint32_t address, uint32_t *val
         /* A Non-secure read of Secure stack memory is therefore an
          * AUVIOL SecureFault, not a MemManage unstacking fault. */
         env->v7m.exception_phase_fault = ARMV7M_EXCP_SECURE;
+    } else if(env->exception_index == EXCP_BUS_FAULT) {
+        /* An unprivileged PPB access by VLLDM, outside an exception sequence. get_phys_addr() has recorded
+         * the precise BusFault. */
+        env->v7m.exception_phase_fault = ARMV7M_EXCP_BUS;
     } else {
         /* An MPU failure during PopStack() is a MemManage unstacking
          * fault. get_phys_addr() has already recorded the address. */
@@ -3524,6 +3534,39 @@ static inline bool pmsav8_check_security_attribution(CPUState *env, uint32_t add
 }
 #endif
 
+#ifdef TARGET_PROTO_ARM_M
+#define ARM_M_STIR_ADDRESS        0xE000EF00
+#define ARM_M_SCS_NS_ALIAS_OFFSET 0x20000
+
+/* Unprivileged data accesses to the PPB from 0xE0001000 to 0xE003FFFF (DWT, FPB, the SCS and its Non-secure
+ * alias, and the unimplemented space between them) generate a synchronous BusFault and are not performed.
+ * Every register there permits privileged access only, except STIR, which permits unprivileged accesses when
+ * CCR.USERSETMPEND of the targeted Security state is set (Armv8-M ARM DDI0553B.r, rules RTKK, NDML, NSWG,
+ * DQQS and MXRW, and the register descriptions in D1.2; ARMv7-M has the same rules). The ITM below
+ * 0xE0001000 permits unprivileged accesses, and the External PPB from 0xE0040000 is IMPLEMENTATION DEFINED.
+ *
+ * `one_shot` is set when an unprivileged access is permitted to an address whose page holds registers it
+ * may not access. */
+static bool v7m_unprivileged_ppb_access_faults(CPUState *env, uint32_t address, bool is_secure, bool *one_shot)
+{
+    if(address < 0xE0001000 || address > 0xE003FFFF) {
+        return false;
+    }
+    /* STIR_NS, in the Non-secure alias of the SCS, exists only on cores with the Security Extension and is
+     * accessible only from Secure state. It targets the Non-secure state. */
+    bool stir = address == ARM_M_STIR_ADDRESS;
+    bool stir_ns = env->v7m.has_trustzone && is_secure && address == ARM_M_STIR_ADDRESS + ARM_M_SCS_NS_ALIAS_OFFSET;
+    if(stir || stir_ns) {
+        bool target_secure = is_secure && stir;
+        if(env->v7m.ccr[target_secure] & FIELD_MASK(V7M_CCR, USERSETMPEND)) {
+            *one_shot = true;
+            return false;
+        }
+    }
+    return true;
+}
+#endif
+
 /* Returns TRANSLATE_SUCCESS (0x0) on success. In case of failure:
  * - for no PMSA returns c5_data/insn value
  * - for PMSA returns enum mpu_result
@@ -3572,6 +3615,30 @@ inline int get_phys_addr(CPUState *env, uint32_t address, bool is_secure, int ac
         }
     }
 
+    /* PPB bus errors come after the Security attribution check (MemA_with_priv_security() calls ValidateAddress()
+     * before _Mem()) and before the MPU, which permits all PPB data accesses (rule TGQD). Exception entry and return,
+     * lazy FP preservation and FNC_RETURN stacking may perform their PPB accesses (rule RJHJ), so only ordinary
+     * accesses are checked. Without the Main Extension the BusFault escalates to HardFault.
+     *
+     * At negative priority with CCR.BFHFNMIGN set, which unprivileged accesses reach with FAULTMASK set or as
+     * LDRT/STRT in a HardFault or NMI handler, the BusFault should be ignored, the write dropped and the read
+     * return UNKNOWN data. get_phys_addr() can only reject or perform an access, so the BusFault is raised
+     * regardless, and escalates to Lockup.
+     *
+     * A debugger translation (`no_page_fault`) of such an address succeeds with a one-shot TLB entry, so that
+     * later unprivileged accesses to the page are checked again. */
+    bool ppb_one_shot = false;
+    if(is_user && access_type != ACCESS_INST_FETCH && env->v7m.exception_phase == V7M_EXCEPTION_PHASE_NONE &&
+       v7m_unprivileged_ppb_access_faults(env, address, is_secure, &ppb_one_shot)) {
+        if(no_page_fault) {
+            ppb_one_shot = true;
+        } else {
+            v7m_record_precise_bus_fault(env, address);
+            env->exception_index = EXCP_BUS_FAULT;
+            return TRANSLATE_FAIL;
+        }
+    }
+
     /* Handle v8M specific MPU */
     if(arm_feature(env, ARM_FEATURE_V8)) {
         *page_size = TARGET_PAGE_SIZE;
@@ -3613,6 +3680,12 @@ inline int get_phys_addr(CPUState *env, uint32_t address, bool is_secure, int ac
     //  See the comment above `idau_sau_page_size` and `idau_sau_allowed_permissions` declarations.
     *page_size = MIN(idau_sau_page_size, *page_size);
     *prot = *prot & idau_sau_allowed_permissions;
+#ifdef TARGET_PROTO_ARM_M
+    if(ppb_one_shot) {
+        /* Setting page size != TARGET_PAGE_SIZE makes the tlb page entry one-shot */
+        *page_size = 0;
+    }
+#endif
 
 #ifdef TARGET_PROTO_ARM_M
     /* TrustZone translation fetch succeeded and MPU check passed.
