@@ -930,6 +930,68 @@ static int v7m_exception_number_with_security(CPUState *env, int exception, bool
 
 static void v7m_enter_lockup(CPUState *env, bool clear_itstate);
 
+/* Records the activation or completion of NMI or HardFault taken to a Security state, for IsActiveForState() in
+ * IsReqExcPriNeg() (Armv8-M ARM DDI0553B.r, E2.1.234 and E2.1.256). `exception` is the number without the banked
+ * Secure bit. */
+static void v7m_set_fixed_priority_active(CPUState *env, uint32_t exception, bool secure, bool active)
+{
+    if(exception != ARMV7M_EXCP_NMI && exception != ARMV7M_EXCP_HARD) {
+        return;
+    }
+    if(active) {
+        env->v7m.fixed_priority_active[secure] |= 1u << exception;
+    } else if(env->v7m.fixed_priority_active[secure] & (1u << exception)) {
+        env->v7m.fixed_priority_active[secure] &= ~(1u << exception);
+    } else {
+        /* A return whose EXC_RETURN.ES was invalid completes the exception for the other state */
+        env->v7m.fixed_priority_active[!secure] &= ~(1u << exception);
+    }
+}
+
+/* ARMv8-M stack limit of the Main or Process stack of a Security state. Returns false when no limit applies: for the
+ * Non-secure stacks without the Main Extension (rules PCRT and NHBX), and with the Main Extension while CCR.STKOFHFNMIGN
+ * is set and the requested execution priority is negative (HardFault or NMI active, or FAULTMASK set). See
+ * LookUpSPLim(), ViolatesSPLim() and IsReqExcPriNeg() (Armv8-M ARM DDI0553B.r, E2.1.272, E2.1.425 and E2.1.256). */
+static bool v8m_get_stack_limit_of(CPUState *env, bool secure, bool process, uint32_t *limit)
+{
+    if(!arm_feature(env, ARM_FEATURE_V8)) {
+        return false;
+    }
+    if(arm_feature(env, ARM_FEATURE_V8M_BASELINE)) {
+        if(!secure) {
+            return false;
+        }
+    } else if((env->v7m.ccr[secure] & FIELD_MASK(V7M_CCR, STKOFHFNMIGN)) &&
+              is_requested_exception_priority_negative(env, secure)) {
+        return false;
+    }
+    *limit = process ? env->v7m.psplim[secure] : env->v7m.msplim[secure];
+    return true;
+}
+
+/* The stack limit of the stack SP currently points to */
+static inline bool v8m_get_stack_limit(CPUState *env, uint32_t *limit)
+{
+    return v8m_get_stack_limit_of(env, env->secure, env->v7m.process_sp, limit);
+}
+
+static inline bool v8m_violates_stack_limit(CPUState *env, uint32_t address)
+{
+    uint32_t limit;
+    return v8m_get_stack_limit(env, &limit) && address < limit;
+}
+
+/* The exception for a violation of a stack limit of a Security state: a STKOF UsageFault, which without the Main
+ * Extension escalates to HardFault (_SP() in Armv8-M ARM DDI0553B.r, E2.1.10, rules ZLZG and CCSC) */
+static int v8m_stack_limit_exception(CPUState *env, bool secure)
+{
+    if(arm_feature(env, ARM_FEATURE_V8M_BASELINE)) {
+        return v7m_exception_number_with_security(env, ARMV7M_EXCP_HARD, secure);
+    }
+    env->v7m.fault_status[secure] |= USAGE_FAULT_STKOF;
+    return v7m_exception_number_with_security(env, ARMV7M_EXCP_USAGE, secure);
+}
+
 static inline int v7m_store_helper(CPUState *env, uint32_t address, uint32_t val, enum arm_m_memory_access_type access_type,
                                    bool is_user, bool is_secure)
 {
@@ -1253,7 +1315,9 @@ void do_v7m_exception_exit(CPUState *env)
     if(env->v7m.exception != 0) {
         /* This ensures we properly complete banked secure exceptions */
         int completed_exception = v7m_exception_number_with_security(env, env->v7m.exception, exception_was_secure);
-        if(!tlib_nvic_complete_irq(completed_exception) && validation_fault == 0) {
+        if(tlib_nvic_complete_irq(completed_exception)) {
+            v7m_set_fixed_priority_active(env, env->v7m.exception, exception_was_secure, false);
+        } else if(validation_fault == 0) {
             /* ValidateExceptionReturn(): returning from an exception which
              * is not active in the state selected by ES raises INVPC. */
             env->v7m.fault_status[env->secure] |= USAGE_FAULT_INVPC;
@@ -1850,10 +1914,13 @@ static bool v7m_exception_targets_secure(CPUState *env, uint32_t *exception)
 
 static void v7m_acknowledge_replacement_exception(CPUState *env, int *active_exception, bool *secure_target)
 {
+    /* DerivedLateArrival() takes the derived exception instead of the original one, which is pending again */
+    v7m_set_fixed_priority_active(env, env->v7m.exception, *secure_target, false);
     env->v7m.exception = tlib_nvic_acknowledge_irq();
     *active_exception = env->v7m.exception;
     tlib_assert(env->v7m.exception != 0);
     *secure_target = v7m_exception_targets_secure(env, &env->v7m.exception);
+    v7m_set_fixed_priority_active(env, env->v7m.exception, *secure_target, true);
 }
 
 static V7MSynchronousFaultResult v7m_resolve_stacking_fault(CPUState *env, int stacking_fault, int acknowledged_exception,
@@ -1971,6 +2038,9 @@ static void do_interrupt_v7m(CPUState *env)
             env->v7m.fault_status[env->secure] |= USAGE_FAULT_INVSTATE;
             v7m_raise_synchronous_exception(env, v7m_exception_number_with_security(env, ARMV7M_EXCP_USAGE, env->secure));
             return;
+        case EXCP_STKOF:
+            v7m_raise_synchronous_exception(env, v8m_stack_limit_exception(env, env->secure));
+            return;
         case EXCP_DIV_0:
             env->v7m.fault_status[env->secure] |= USAGE_FAULT_DIVBYZERO;
             v7m_raise_synchronous_exception(env, v7m_exception_number_with_security(env, ARMV7M_EXCP_USAGE, env->secure));
@@ -2077,6 +2147,7 @@ static void do_interrupt_v7m(CPUState *env)
 
         secure_target = v7m_exception_targets_secure(env, &env->v7m.exception);
     }
+    v7m_set_fixed_priority_active(env, env->v7m.exception, secure_target, true);
 
     env->condexec_bits = 0;
     env->v7m.exception_phase = V7M_EXCEPTION_PHASE_STACKING;
@@ -4013,14 +4084,24 @@ void HELPER(v7m_msr)(CPUState *env, uint32_t reg, uint32_t val)
             }
             break;
         case NON_SECURE_REG(24): /* SP_NS */
+        {
             //  bits [1:0] of SP are WI or SBZP
             val &= 0xFFFFFFFC;
-            if(is_using_process_sp(env, in_handler_mode(env), false)) {
+            bool process = is_using_process_sp(env, in_handler_mode(env), false);
+            /* MSR SP_NS is subject to the stack limit of the Non-secure stack it writes (Armv8-M ARM DDI0553B.r,
+             * C2.4.126). The STKOF UsageFault may target either Security state; it targets the current one. */
+            uint32_t limit;
+            if(v8m_get_stack_limit_of(env, false, process, &limit) && val < limit) {
+                env->exception_index = EXCP_STKOF;
+                cpu_loop_exit_restore(env, (uintptr_t)GETPC(), true);
+            }
+            if(process) {
                 env->v7m.other_ss_psp = val;
             } else {
                 env->v7m.other_ss_msp = val;
             }
             break;
+        }
         default:
             /* ??? For debugging only.  */
             cpu_abort(env, "Unimplemented system register write (%d)\n", reg);
@@ -4994,6 +5075,12 @@ void HELPER(v8m_blxns)(CPUState *env, uint32_t addr, uint32_t link)
              * RGVB: The IPSR is stacked in the partial RETPSR, and CONTROL.SFPA is stacked in bit [20] of the partial RETPSR. */
             uint32_t partialRETPSR = env->v7m.exception;
             partialRETPSR |= extract32(env->v7m.control[M_REG_COMMON], ARM_CONTROL_SFPA, 1) > 0 ? RETPSR_SFPA : 0;
+            /* Stack() does not write below the stack limit, and the SP update then raises STKOF and leaves SP
+             * unchanged */
+            if(v8m_violates_stack_limit(env, env->regs[13] - 8)) {
+                env->exception_index = EXCP_STKOF;
+                cpu_loop_exit_restore(env, (uintptr_t)GETPC(), true);
+            }
             /* Push the return address last so it is at offset 0 of the
              * function return stack frame, below RETPSR at offset 4. */
             env->v7m.exception_phase = V7M_EXCEPTION_PHASE_STACKING;
@@ -5155,6 +5242,16 @@ static inline void vlldm_load_helper(CPUState *env, uint32_t *address, uint32_t 
         v7m_raise_synchronous_exception_and_exit(env, env->v7m.exception_phase_fault, error_pc);
     }
     *address += 4;
+}
+
+/* ARMv8-M: an instruction that would set SP below the limit of the stack in use (MSPLIM or PSPLIM)
+ * raises a STKOF UsageFault and leaves SP unchanged. */
+void HELPER(v8m_stackcheck)(CPUState *env, uint32_t new_sp)
+{
+    if(v8m_violates_stack_limit(env, new_sp)) {
+        env->exception_index = EXCP_STKOF;
+        cpu_loop_exit_restore(env, (uintptr_t)GETPC(), true);
+    }
 }
 
 void HELPER(v8m_vlstm)(CPUState *env, uint32_t address)

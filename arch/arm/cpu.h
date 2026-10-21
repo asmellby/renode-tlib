@@ -58,6 +58,7 @@
 #define EXCP_SECURE         19 /* TrustZone Secure fault */
 #define EXCP_DIV_0          20 /* Integer divide by zero fault */
 #define EXCP_BUS_FAULT      21 /* Synchronous BusFault: precise data access or instruction fetch */
+#define EXCP_STKOF          22 /* ARMv8-M stack limit violation (STKOF usage fault) */
 
 #define ARMV7M_EXCP_RESET    1
 #define ARMV7M_EXCP_NMI      2
@@ -111,6 +112,7 @@ typedef enum {
 /* Usage Fault : bits 16-31 of CFSR */
 #define USAGE_FAULT_OFFSET     16
 #define USAGE_FAULT_DIVBYZERO  (1 << 9) << USAGE_FAULT_OFFSET
+#define USAGE_FAULT_STKOF      (1 << 4) << USAGE_FAULT_OFFSET
 #define USAGE_FAULT_UNALIGNED  (1 << 8) << USAGE_FAULT_OFFSET
 #define USAGE_FAULT_NOCP       (1 << 3) << USAGE_FAULT_OFFSET
 #define USAGE_FAULT_INVPC      (1 << 2) << USAGE_FAULT_OFFSET
@@ -183,6 +185,10 @@ typedef struct DisasContext {
     bool eci_handled;
     /* True if MVE insns are definitely not predicated by VPR or LTPSIZE */
     bool mve_no_pred;
+    /* ARMv8-M: check writes to SP against the stack limit registers */
+    bool v8m_stackcheck;
+    /* The instruction being translated has checked an address at or below its SP writeback value */
+    bool v8m_sp_writeback_checked;
 } DisasContext;
 
 /* ARM-specific interrupt pending bits.  */
@@ -378,6 +384,9 @@ typedef struct CPUState {
         uint32_t secure_fault_address; /* SFAR. It can be shared with MMFAR, but it's more hassle, so let's keep it separate */
         uint32_t memory_fault_address[M_REG_NUM_BANKS];
         uint32_t exception;
+        /* Active NMI and HardFault, as bits (1 << exception number), indexed by the Security state they were taken
+         * to. Kept from the exceptions this CPU activates and completes. */
+        uint32_t fixed_priority_active[M_REG_NUM_BANKS];
         uint32_t primask[M_REG_NUM_BANKS];
         uint32_t faultmask[M_REG_NUM_BANKS];
         uint32_t ccr[M_REG_NUM_BANKS];
@@ -739,7 +748,7 @@ static inline bool in_privileged_mode(CPUState *env)
 static inline bool is_requested_exception_priority_negative(CPUState *env, bool secure)
 {
     /* ARM: IsReqExcPriNeg */
-    return env->v7m.exception == ARMV7M_EXCP_NMI || env->v7m.exception == ARMV7M_EXCP_HARD || env->v7m.faultmask[secure];
+    return env->v7m.fixed_priority_active[secure] != 0 || env->v7m.faultmask[secure];
 }
 #endif
 

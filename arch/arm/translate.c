@@ -167,6 +167,9 @@ static void store_reg(DisasContext *s, int reg, TCGv var)
     if(reg == SP_32) {
         //  bits [1:0] of SP are WI or SBZP
         tcg_gen_andi_i32(var, var, ~3);
+        if(s->v8m_stackcheck && !s->v8m_sp_writeback_checked) {
+            gen_helper_v8m_stackcheck(cpu_env, var);
+        }
     }
 #endif
 
@@ -860,6 +863,26 @@ static inline void gen_bx(DisasContext *s, TCGv var, int stack_announcement_type
     tcg_gen_andi_i32(cpu_R[15], var, ~1);
     tcg_gen_andi_i32(var, var, 1);
     store_cpu_field(var, thumb);
+#endif
+}
+
+/* ARMv8-M: a load or store that writes back SP checks the stack limit before its memory accesses. Single and
+ * dual accesses check the new SP (`if n == 13 && wback then violatesLimit = ViolatesSPLim(LookUpSP(),
+ * offset_addr)`), multiple accesses their lowest address. The pseudocode for PUSH and STMDB skips only the
+ * stores below the limit, but when STKOF is generated it is UNKNOWN whether accesses above the limit are
+ * performed, so none are (Armv8-M ARM DDI0553B.r, rules YVWT, BJHX and CMBW). The checked address is
+ * `addr + offset`. */
+static inline void gen_v8m_stackcheck_wback(DisasContext *s, TCGv addr, int32_t offset)
+{
+#ifdef TARGET_PROTO_ARM_M
+    if(s->v8m_stackcheck) {
+        TCGv new_sp = tcg_temp_new_i32();
+        tcg_gen_addi_i32(new_sp, addr, offset);
+        gen_helper_v8m_stackcheck(cpu_env, new_sp);
+        tcg_temp_free_i32(new_sp);
+        /* The SP written back is at or above the checked address, so it does not need another check */
+        s->v8m_sp_writeback_checked = true;
+    }
 #endif
 }
 
@@ -4288,6 +4311,10 @@ static int disas_vfp_insn(CPUState *env, DisasContext *s, uint32_t insn)
                     }
                     if(insn & (1 << 24)) { /* pre-decrement */
                         tcg_gen_addi_i32(addr, addr, -((insn & 0xff) << 2));
+                    }
+                    if(rn == 13 && w) {
+                        /* The lowest address: the new SP of VPUSH and VSTMDB, the old SP of VPOP and VLDMIA */
+                        gen_v8m_stackcheck_wback(s, addr, 0);
                     }
 
                     if(precision == DOUBLE_PRECISION) {
@@ -9498,6 +9525,25 @@ static int gen_thumb2_data_op(DisasContext *s, int op, int conds, uint32_t shift
     return 0;
 }
 
+/* ARMv8-M: a flag-setting data processing instruction that writes SP checks the stack limit before it updates the flags
+ * (`RSPCheck[d] = result` precedes the APSR update in ADD and SUB (SP plus/minus immediate/register), Armv8-M ARM
+ * DDI0553B.r, C2.4.3, C2.4.4, C2.4.237 and C2.4.238). This computes the result into a temporary for the check. */
+static void gen_v8m_stackcheck_data_op(DisasContext *s, int op, TCGv t0, TCGv t1)
+{
+#ifdef TARGET_PROTO_ARM_M
+    if(!s->v8m_stackcheck) {
+        return;
+    }
+    TCGv result = tcg_temp_new_i32();
+    tcg_gen_mov_i32(result, t0);
+    if(gen_thumb2_data_op(s, op, 0, 0, result, t1) == 0) {
+        gen_helper_v8m_stackcheck(cpu_env, result);
+        s->v8m_sp_writeback_checked = true;
+    }
+    tcg_temp_free_i32(result);
+#endif
+}
+
 #ifdef TARGET_PROTO_ARM_M
 #include "translate_lob.h"
 #include "translate_mve.h"
@@ -10733,7 +10779,9 @@ static void fp_sysreg_to_memory(DisasContext *s, void *opaque, TCGv_i32 value, b
         tcg_gen_addi_i32(addr, addr, offset);
     }
 
-    //  TODO: Add stack check (ViolatesSPLim), check that says if SP won't violate its boundaries after writeback
+    if(a->rn == 13 && a->w) {
+        gen_v8m_stackcheck_wback(s, addr, a->p ? 0 : offset);
+    }
 
     if(do_access) {
         tcg_gen_qemu_st32(value, addr, context_to_mmu_index(s));
@@ -10771,7 +10819,9 @@ static TCGv_i32 memory_to_fp_sysreg(DisasContext *s, void *opaque, bool do_acces
         tcg_gen_addi_i32(addr, addr, offset);
     }
 
-    //  TODO: Add stack check (ViolatesSPLim), check that says if SP won't violate its boundaries after writeback
+    if(a->rn == 13 && a->w) {
+        gen_v8m_stackcheck_wback(s, addr, a->p ? 0 : offset);
+    }
 
     if(do_access) {
         value = tcg_temp_new_i32();
@@ -12709,6 +12759,9 @@ static int disas_thumb2_insn(CPUState *env, DisasContext *s, uint32_t insn)
                         tcg_gen_addi_i32(addr, addr, offset);
                         offset = 0;
                     }
+                    if(rn == 13 && (insn & (1 << 21))) {
+                        gen_v8m_stackcheck_wback(s, addr, offset);
+                    }
                     if(insn & (1 << 20)) {
                         /* ldrd */
                         tmp = gen_ld32(addr, context_to_mmu_index(s));
@@ -12948,6 +13001,10 @@ static int disas_thumb2_insn(CPUState *env, DisasContext *s, uint32_t insn)
                     }
                     if(insn & (1 << 24)) {
                         tcg_gen_addi_i32(addr, addr, -offset);
+                    }
+                    if(rn == 13 && (insn & (1 << 21))) {
+                        /* The lowest address: the new SP of STMDB, the old SP of LDMIA */
+                        gen_v8m_stackcheck_wback(s, addr, 0);
                     }
 
                     TCGV_UNUSED(loaded_var);
@@ -13232,6 +13289,9 @@ static int disas_thumb2_insn(CPUState *env, DisasContext *s, uint32_t insn)
                     tmp2 = load_reg(s, rm);
 
                     gen_arm_shift_im(tmp2, shiftop, shift, logic_cc);
+                    if(rd == 13 && conds) {
+                        gen_v8m_stackcheck_data_op(s, op, tmp, tmp2);
+                    }
                     if(gen_thumb2_data_op(s, op, conds, 0, tmp, tmp2)) {
                         goto illegal_op;
                     }
@@ -15476,11 +15536,14 @@ static int disas_thumb2_insn(CPUState *env, DisasContext *s, uint32_t insn)
                         tmp = load_reg(s, rn);
                     }
                     op = (insn >> 21) & 0xf;
+                    rd = (insn >> 8) & 0xf;
+                    if(rd == 13 && (insn & (1 << 20))) {
+                        gen_v8m_stackcheck_data_op(s, op, tmp, tmp2);
+                    }
                     if(gen_thumb2_data_op(s, op, (insn & (1 << 20)) != 0, shifter_out, tmp, tmp2)) {
                         goto illegal_op;
                     }
                     tcg_temp_free_i32(tmp2);
-                    rd = (insn >> 8) & 0xf;
                     if(rd != 15) {
                         store_reg(s, rd, tmp);
                     } else {
@@ -15596,6 +15659,14 @@ static int disas_thumb2_insn(CPUState *env, DisasContext *s, uint32_t insn)
                             goto illegal_op;
                     }
                 }
+            }
+            if(rn == 13 && writeback) {
+                /* Only the defined size and sign combinations: LDRB/LDRSB/LDRH/LDRSH/LDR and STRB/STRH/STR */
+                if((insn & (1 << 20)) ? (op == 3 || op > 5) : op > 2) {
+                    tcg_temp_free_i32(addr);
+                    goto illegal_op;
+                }
+                gen_v8m_stackcheck_wback(s, addr, postinc ? imm : 0);
             }
             if(insn & (1 << 20)) {
                 /* Load.  */
@@ -16207,6 +16278,7 @@ static void disas_thumb_insn(CPUState *env, DisasContext *s, uint16_t insn, uint
                     if((insn & (1 << 11)) == 0) {
                         tcg_gen_addi_i32(addr, addr, -offset);
                     }
+                    gen_v8m_stackcheck_wback(s, addr, 0);
                     for(i = 0; i < 8; i++) {
                         if(insn & (1 << i)) {
                             if(insn & (1 << 11)) {
@@ -16469,6 +16541,7 @@ int disas_insn(CPUState *env, DisasContext *dc)
     target_ulong fault_address = start_pc;
 
 #ifdef TARGET_PROTO_ARM_M
+    dc->v8m_sp_writeback_checked = false;
     if(unlikely(!dc->thumb)) {
         /* Armv8-M ARM rule RSQLX: no instruction can execute with
          * EPSR.T clear. */
@@ -16569,6 +16642,9 @@ void setup_disas_context(DisasContextBase *base, CPUState *env)
     dc->condexec_cond = ARM_TBFLAG_CONDEXEC(dc->base.tb->flags) >> 4;
     dc->user = (ARM_TBFLAG_PRIV(dc->base.tb->flags) == 0);
     dc->vfp_enabled = ARM_TBFLAG_VFPEN(dc->base.tb->flags);
+#ifdef TARGET_PROTO_ARM_M
+    dc->v8m_stackcheck = arm_feature(env, ARM_FEATURE_V8);
+#endif
 #ifndef TARGET_PROTO_ARM_M
     dc->vec_len = ARM_TBFLAG_VECLEN(dc->base.tb->flags);
 #endif  //  TARGET_PROTO_ARM_M

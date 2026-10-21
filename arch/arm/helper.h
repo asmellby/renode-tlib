@@ -88,6 +88,7 @@ DEF_HELPER_1(v8m_sg, void, env)
 DEF_HELPER_2(v8m_bx_update_pc, void, env, i32)
 
 DEF_HELPER_2(v8m_vlstm, void, env, i32)
+DEF_HELPER_2(v8m_stackcheck, void, env, i32)
 DEF_HELPER_2(v8m_vlldm, void, env, i32)
 #endif
 
