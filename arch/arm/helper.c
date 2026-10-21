@@ -1875,7 +1875,9 @@ static V7MSynchronousFaultResult v7m_resolve_stacking_fault(CPUState *env, int s
     return result;
 }
 
-static int v7m_prepare_exception_taken(CPUState *env, uint32_t *lr, bool secure_target, bool do_tailchain)
+/* `frame_on_process_sp` selects the stack of the current Security state that holds the frame */
+static int v7m_prepare_exception_taken(CPUState *env, uint32_t *lr, bool secure_target, bool do_tailchain,
+                                       bool frame_on_process_sp)
 {
     int stack_status = 0;
 
@@ -1898,6 +1900,12 @@ static int v7m_prepare_exception_taken(CPUState *env, uint32_t *lr, bool secure_
                 bool additional_state_already_present = do_tailchain && !previous_exception_was_secure;
                 if((*lr & ARM_EXC_RETURN_DCRS_MASK) && !additional_state_already_present) {
                     tlib_printf(LOG_LEVEL_NOISY, "Pushing additional state context registers on stack");
+                    /* PushCalleeStack() pushes to the Secure stack that holds the frame, which on a tail-chain
+                     * EXC_RETURN.Mode and SPSEL select rather than the current SP, and moves that SP (Armv8-M ARM
+                     * DDI0553B.r, E2.1.327). Every caller that gets here is in Secure state. */
+                    tlib_assert(env->secure);
+                    bool was_on_process_sp = env->v7m.process_sp;
+                    switch_v7m_sp(env, frame_on_process_sp);
                     stack_status |= v7m_push(env, env->regs[11]);
                     stack_status |= v7m_push(env, env->regs[10]);
                     stack_status |= v7m_push(env, env->regs[9]);
@@ -1913,6 +1921,7 @@ static int v7m_prepare_exception_taken(CPUState *env, uint32_t *lr, bool secure_
                     /* Set SFTC bit */
                     integrity |= (*lr & ARM_EXC_RETURN_NFPCA_MASK) >> ARM_EXC_RETURN_NFPCA;
                     stack_status |= v7m_push(env, integrity);
+                    switch_v7m_sp(env, was_on_process_sp);
 
                     /* On transition between security states, let's clear registers (RWBND) */
                     for(int i = 0; i <= 12; ++i) {
@@ -2099,6 +2108,10 @@ static void do_interrupt_v7m(CPUState *env)
     env->condexec_bits = 0;
     env->v7m.exception_phase = V7M_EXCEPTION_PHASE_STACKING;
     env->v7m.exception_phase_fault = 0;
+    /* The stack that holds the frame: the current one, or on a tail-chain the one EXC_RETURN names */
+    bool frame_on_process_sp = exception_return_tailchain ? (exception_return_type & ARM_EXC_RETURN_MODE_MASK) &&
+                                                                (exception_return_type & ARM_EXC_RETURN_SPSEL_MASK)
+                                                          : env->v7m.process_sp;
 
     if(!exception_return_tailchain) {
         /* Align stack pointer.  */
@@ -2196,7 +2209,8 @@ static void do_interrupt_v7m(CPUState *env)
         }
     }
 
-    int exception_taken_stack_status = v7m_prepare_exception_taken(env, &lr, secure_target, exception_taken_tailchain);
+    int exception_taken_stack_status =
+        v7m_prepare_exception_taken(env, &lr, secure_target, exception_taken_tailchain, frame_on_process_sp);
     int exception_taken_stacking_fault = env->v7m.exception_phase_fault;
     tlib_assert(!exception_taken_stack_status || exception_taken_stacking_fault != 0);
     env->v7m.exception_phase_fault = 0;
@@ -2211,7 +2225,7 @@ static void do_interrupt_v7m(CPUState *env)
             lockup_after_exception_taken = true;
         }
 
-        v7m_prepare_exception_taken(env, &lr, secure_target, true);
+        v7m_prepare_exception_taken(env, &lr, secure_target, true, frame_on_process_sp);
         env->v7m.exception_phase_fault = 0;
     }
 
@@ -2271,10 +2285,12 @@ static void do_interrupt_v7m(CPUState *env)
         v7m_acknowledge_replacement_exception(env, &active_exception, &secure_target);
         if(env->v7m.has_trustzone) {
             /* ExceptionTaken() for the replacement is a tail-chain: PushCalleeStack() pushes with the
-             * privilege of the mode in EXC_RETURN (Armv8-M ARM DDI0553B.r, E2.1.327). */
+             * privilege of the mode in EXC_RETURN (Armv8-M ARM DDI0553B.r, E2.1.327). A callee frame is
+             * pushed only when the first ExceptionTaken() targeted Secure state from a Secure background,
+             * so the current Security state is still that of the frame. */
             env->v7m.exception_phase = V7M_EXCEPTION_PHASE_STACKING;
             env->v7m.stacking_is_user = v7m_exc_return_is_user(env, lr);
-            v7m_prepare_exception_taken(env, &lr, secure_target, true);
+            v7m_prepare_exception_taken(env, &lr, secure_target, true, frame_on_process_sp);
             env->v7m.exception_phase = V7M_EXCEPTION_PHASE_NONE;
             env->v7m.exception_phase_fault = 0;
             switch_v7m_security_state(env, secure_target);
