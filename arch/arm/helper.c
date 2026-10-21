@@ -951,7 +951,9 @@ static void v7m_set_fixed_priority_active(CPUState *env, uint32_t exception, boo
 /* ARMv8-M stack limit of the Main or Process stack of a Security state. Returns false when no limit applies: for the
  * Non-secure stacks without the Main Extension (rules PCRT and NHBX), and with the Main Extension while CCR.STKOFHFNMIGN
  * is set and the requested execution priority is negative (HardFault or NMI active, or FAULTMASK set). See
- * LookUpSPLim(), ViolatesSPLim() and IsReqExcPriNeg() (Armv8-M ARM DDI0553B.r, E2.1.272, E2.1.425 and E2.1.256). */
+ * LookUpSPLim(), ViolatesSPLim() and IsReqExcPriNeg() (Armv8-M ARM DDI0553B.r, E2.1.272, E2.1.425 and E2.1.256).
+ *
+ * During exception stacking, IsReqExcPriNeg() is the one sampled before the incoming exception was activated. */
 static bool v8m_get_stack_limit_of(CPUState *env, bool secure, bool process, uint32_t *limit)
 {
     if(!arm_feature(env, ARM_FEATURE_V8)) {
@@ -962,14 +964,17 @@ static bool v8m_get_stack_limit_of(CPUState *env, bool secure, bool process, uin
             return false;
         }
     } else if((env->v7m.ccr[secure] & FIELD_MASK(V7M_CCR, STKOFHFNMIGN)) &&
-              is_requested_exception_priority_negative(env, secure)) {
+              (env->v7m.exception_phase == V7M_EXCEPTION_PHASE_STACKING
+                   ? env->v7m.stacking_priority_negative
+                   : is_requested_exception_priority_negative(env, secure))) {
         return false;
     }
     *limit = process ? env->v7m.psplim[secure] : env->v7m.msplim[secure];
     return true;
 }
 
-/* The stack limit of the stack SP currently points to */
+/* The stack limit of the stack SP currently points to. It is selected by v7m.process_sp, which during exception
+ * stacking still names the stack of the interrupted context. */
 static inline bool v8m_get_stack_limit(CPUState *env, uint32_t *limit)
 {
     return v8m_get_stack_limit_of(env, env->secure, env->v7m.process_sp, limit);
@@ -1107,6 +1112,24 @@ static inline int v7m_load_helper(CPUState *env, uint32_t address, uint32_t *val
 static int v7m_push(CPUState *env, uint32_t val)
 {
     uint32_t address = env->regs[13] - 4;
+
+    /* Stack() does not perform stacking writes below the stack limit, and PushStack() then sets SP
+     * through _SP(), which on exception entry stops SP at the limit and raises a STKOF UsageFault
+     * (Armv8-M ARM DDI0553B.r, E2.1.387, E2.1.328 and E2.1.10). Words of the frame at or above the
+     * limit are still written ("Push non-violating locations" is IMPLEMENTATION DEFINED). The STKOF
+     * is raised even when a stacking access has faulted, and the two are merged later. */
+    uint32_t limit;
+    if(v8m_get_stack_limit(env, &limit) && address < limit) {
+        env->regs[13] = limit;
+        int limit_fault = v8m_stack_limit_exception(env, env->secure);
+        if(env->v7m.exception_phase_fault == 0) {
+            env->v7m.exception_phase_fault = limit_fault;
+        } else if(env->v7m.exception_phase_fault != limit_fault) {
+            env->v7m.exception_phase_limit_fault = limit_fault;
+        }
+        return 1;
+    }
+
     /* PushStack() allocates the complete frame even if a stacking access
      * faults. Rule RQSSB permits abandoning the remaining memory accesses and
      * we choose to abandon them while still advancing the architectural SP. */
@@ -1668,34 +1691,38 @@ void fp_lsp_save_to_stack(CPUState *env, void *fault_pc)
         /* Remember, we operate with double-precision aliases here
          * so for D7, up to S14, S15 are preserved, and so on
          */
+        /* PreserveFPState() performs no memory accesses when FPCCR.SPLIMVIOL is set, but still clears the registers */
+        bool splimviol = FIELD_EX32(env->v7m.fpccr[is_secure], V7M_FPCCR, SPLIMVIOL);
         bool failed = false;
         env->v7m.exception_phase = V7M_EXCEPTION_PHASE_LAZY_FP;
         env->v7m.exception_phase_fault = 0;
-        for(int i = 0; i < 8; ++i) {
-            if(!lsp_store_helper(env, &address, env->vfp.regs[i], is_secure) ||
-               !lsp_store_helper(env, &address, env->vfp.regs[i] >> 32, is_secure)) {
-                failed = true;
-                break;
+        if(!splimviol) {
+            for(int i = 0; i < 8; ++i) {
+                if(!lsp_store_helper(env, &address, env->vfp.regs[i], is_secure) ||
+                   !lsp_store_helper(env, &address, env->vfp.regs[i] >> 32, is_secure)) {
+                    failed = true;
+                    break;
+                }
             }
-        }
-        if(!failed) {
-            uint32_t fpscr = vfp_get_fpscr(env);
-            failed = !lsp_store_helper(env, &address, fpscr, is_secure);
-        }
+            if(!failed) {
+                uint32_t fpscr = vfp_get_fpscr(env);
+                failed = !lsp_store_helper(env, &address, fpscr, is_secure);
+            }
 
-        if(!failed && arm_feature(env, ARM_FEATURE_V8)) {
-            if(arm_feature(env, ARM_FEATURE_MVE)) {
-                failed = !lsp_store_helper(env, &address, env->v7m.vpr, is_secure);
-            } else {
-                /* Write UNKNOWN if MVE is not implemented */
-                failed = !lsp_store_helper(env, &address, 0xBADCAFEE, is_secure);
-            }
-            if(!failed && is_secure && (env->v7m.fpccr[M_REG_COMMON] & ARM_FPCCR_TS_MASK) > 0) {
-                for(int i = 8; i < 16; ++i) {
-                    if(!lsp_store_helper(env, &address, env->vfp.regs[i], is_secure) ||
-                       !lsp_store_helper(env, &address, env->vfp.regs[i] >> 32, is_secure)) {
-                        failed = true;
-                        break;
+            if(!failed && arm_feature(env, ARM_FEATURE_V8)) {
+                if(arm_feature(env, ARM_FEATURE_MVE)) {
+                    failed = !lsp_store_helper(env, &address, env->v7m.vpr, is_secure);
+                } else {
+                    /* Write UNKNOWN if MVE is not implemented */
+                    failed = !lsp_store_helper(env, &address, 0xBADCAFEE, is_secure);
+                }
+                if(!failed && is_secure && (env->v7m.fpccr[M_REG_COMMON] & ARM_FPCCR_TS_MASK) > 0) {
+                    for(int i = 8; i < 16; ++i) {
+                        if(!lsp_store_helper(env, &address, env->vfp.regs[i], is_secure) ||
+                           !lsp_store_helper(env, &address, env->vfp.regs[i] >> 32, is_secure)) {
+                            failed = true;
+                            break;
+                        }
                     }
                 }
             }
@@ -1780,7 +1807,11 @@ static inline void fpccr_update(CPUState *env, uint32_t frameptr, int original_e
     /* Mark that Lazy Floating Point preservation will happen */
     env->v7m.fpccr[is_secure] |= FIELD_MASK(V7M_FPCCR, LSPACT);
 
-    /* TODO: Check if SP violates the current stack limit and set SPLIMVIOL accordingly */
+    /* UpdateFPCCR(): on exception entry, flag a context below the stack limit, so that PreserveFPState() does not
+     * write it. VLSTM does not apply the limit (Armv8-M ARM DDI0553B.r, E2.1.411 and the VLSTM pseudocode). */
+    bool apply_sp_limit = env->v7m.exception_phase == V7M_EXCEPTION_PHASE_STACKING;
+    env->v7m.fpccr[is_secure] =
+        FIELD_DP32(env->v7m.fpccr[is_secure], V7M_FPCCR, SPLIMVIOL, apply_sp_limit && v8m_violates_stack_limit(env, frameptr));
 
     /* Update fields to information about the current CPU state */
     env->v7m.fpccr[M_REG_COMMON] = FIELD_DP32(env->v7m.fpccr[M_REG_COMMON], V7M_FPCCR, S, is_secure);
@@ -2005,6 +2036,31 @@ static void v7m_clear_active_fp_state_on_exception_entry(CPUState *env)
     env->v7m.control[M_REG_COMMON] &= ~(ARM_CONTROL_FPCA_MASK | ARM_CONTROL_SFPA_MASK);
 }
 
+/* The faults of PushStack() or PushCalleeStack(): a stacking access fault, and a stack limit fault that _SP() raises
+ * after it, are combined by MergeExcInfo() (Armv8-M ARM DDI0553B.r, E2.1.297). The one with the higher priority is
+ * taken through DerivedLateArrival(), and the other is pended ("Overridden exceptions pended" is IMPLEMENTATION
+ * DEFINED). Resolving the second fault against the exception the first one left active lets the NVIC model choose,
+ * except that when both are the same HardFault, which MergeExcInfo() takes once, the second one is dropped. The stack
+ * limit fault escalates to that HardFault when its UsageFault could not become active (FPCCR.UFRDY clear). */
+static V7MSynchronousFaultResult v7m_resolve_stacking_faults(CPUState *env, int stacking_fault, int limit_fault,
+                                                             int acknowledged_exception, int *active_exception,
+                                                             bool *secure_target)
+{
+    V7MSynchronousFaultResult result =
+        v7m_resolve_stacking_fault(env, stacking_fault, acknowledged_exception, active_exception, secure_target);
+    if(limit_fault == 0 || result == V7M_SYNCHRONOUS_FAULT_LOCKUP) {
+        return result;
+    }
+    int hard_fault = v7m_exception_number_with_security(env, ARMV7M_EXCP_HARD, env->secure);
+    bool limit_fault_is_hard_fault =
+        limit_fault == hard_fault ||
+        !(tlib_nvic_get_fpccr_ready_bits(*active_exception, env->secure) & FIELD_MASK(V7M_FPCCR, UFRDY));
+    if(*active_exception == hard_fault && limit_fault_is_hard_fault) {
+        return result;
+    }
+    return v7m_resolve_stacking_fault(env, limit_fault, *active_exception, active_exception, secure_target);
+}
+
 static void do_interrupt_v7m(CPUState *env)
 {
     uint32_t xpsr = xpsr_read(env);
@@ -2118,6 +2174,9 @@ static void do_interrupt_v7m(CPUState *env)
         lr ^= ARM_EXC_RETURN_NFPCA_MASK;
     }
 
+    /* IsReqExcPriNeg() during stacking considers the exceptions that were active before this one. A
+     * tail-chain has already deactivated the returning exception. */
+    env->v7m.stacking_priority_negative = is_requested_exception_priority_negative(env, env->secure);
     env->v7m.exception = tlib_nvic_acknowledge_irq();
     acknowledged_exception = env->v7m.exception;
     active_exception = acknowledged_exception;
@@ -2150,6 +2209,7 @@ static void do_interrupt_v7m(CPUState *env)
     v7m_set_fixed_priority_active(env, env->v7m.exception, secure_target, true);
 
     env->condexec_bits = 0;
+    env->v7m.exception_phase_limit_fault = 0;
     env->v7m.exception_phase = V7M_EXCEPTION_PHASE_STACKING;
     env->v7m.exception_phase_fault = 0;
 
@@ -2225,8 +2285,10 @@ static void do_interrupt_v7m(CPUState *env)
     }
 
     int stacking_fault = env->v7m.exception_phase_fault;
+    int stacking_limit_fault = env->v7m.exception_phase_limit_fault;
     tlib_assert(!stack_status || stacking_fault != 0);
     env->v7m.exception_phase_fault = 0;
+    env->v7m.exception_phase_limit_fault = 0;
     bool ignore_followup_stacking_faults = false;
     bool lockup_after_exception_taken = false;
     bool exception_taken_tailchain = exception_return_tailchain;
@@ -2237,8 +2299,8 @@ static void do_interrupt_v7m(CPUState *env)
          * DerivedLateArrival() actually selects, not the original
          * exception. Any later nonterminal stacking fault is ignored by the
          * IgnoreFaults_STACK/ALL mode used for forward progress. */
-        V7MSynchronousFaultResult stacking_fault_result =
-            v7m_resolve_stacking_fault(env, stacking_fault, acknowledged_exception, &active_exception, &secure_target);
+        V7MSynchronousFaultResult stacking_fault_result = v7m_resolve_stacking_faults(
+            env, stacking_fault, stacking_limit_fault, acknowledged_exception, &active_exception, &secure_target);
         ignore_followup_stacking_faults = true;
         exception_taken_tailchain = false;
         if(stacking_fault_result == V7M_SYNCHRONOUS_FAULT_LOCKUP) {
@@ -2250,15 +2312,18 @@ static void do_interrupt_v7m(CPUState *env)
 
     int exception_taken_stack_status = v7m_prepare_exception_taken(env, &lr, secure_target, exception_taken_tailchain);
     int exception_taken_stacking_fault = env->v7m.exception_phase_fault;
+    int exception_taken_limit_fault = env->v7m.exception_phase_limit_fault;
     tlib_assert(!exception_taken_stack_status || exception_taken_stacking_fault != 0);
     env->v7m.exception_phase_fault = 0;
+    env->v7m.exception_phase_limit_fault = 0;
 
     if(exception_taken_stacking_fault != 0 && !ignore_followup_stacking_faults) {
         /* A PushCalleeStack() failure occurs within ExceptionTaken(), so
          * DerivedLateArrival() re-enters ExceptionTaken() as a tail-chain
          * using the LR value already finalized for the original exception. */
-        V7MSynchronousFaultResult stacking_fault_result = v7m_resolve_stacking_fault(
-            env, exception_taken_stacking_fault, acknowledged_exception, &active_exception, &secure_target);
+        V7MSynchronousFaultResult stacking_fault_result =
+            v7m_resolve_stacking_faults(env, exception_taken_stacking_fault, exception_taken_limit_fault, acknowledged_exception,
+                                        &active_exception, &secure_target);
         if(stacking_fault_result == V7M_SYNCHRONOUS_FAULT_LOCKUP) {
             lockup_after_exception_taken = true;
         }

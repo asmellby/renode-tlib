@@ -407,6 +407,12 @@ typedef struct CPUState {
         uint32_t vpr;
         V7MExceptionPhase exception_phase;
         int32_t exception_phase_fault;
+        /* IsReqExcPriNeg() of the stack being pushed during exception stacking. The NVIC model
+         * activates the incoming exception before stacking, so this is sampled before that. */
+        bool stacking_priority_negative;
+        /* The exception of a stack limit violation during exception stacking when exception_phase_fault already
+         * holds another fault of the same push sequence */
+        int32_t exception_phase_limit_fault;
         /* A fault generated while returning from an exception reuses the
          * existing stack frame. The next exception entry consumes this saved
          * EXC_RETURN as a tail-chain instead of pushing another frame. */
