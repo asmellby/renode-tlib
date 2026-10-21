@@ -877,6 +877,7 @@ enum arm_features {
     ARM_FEATURE_CBAR_RO, /* has cp15 CBAR and it is read-only */
     ARM_FEATURE_LPAE,    /* v7 Only, Large Physical Address Extension */
     ARM_FEATURE_V8_1M,
+    ARM_FEATURE_V8M_BASELINE, /* Armv8-M without the Main Extension */
 };
 
 /* Values for M-profile PSR.ECI for MVE insns */

@@ -379,6 +379,7 @@ static void cpu_reset_model_id(CPUState *env, uint32_t id)
             break;
         case ARM_CPUID_CORTEXM23:
             set_feature(env, ARM_FEATURE_V8);
+            set_feature(env, ARM_FEATURE_V8M_BASELINE);
             set_feature(env, ARM_FEATURE_V7);
             set_feature(env, ARM_FEATURE_V6);
             set_feature(env, ARM_FEATURE_V5);
@@ -3815,9 +3816,9 @@ uint32_t HELPER(v7m_mrs)(CPUState *env, uint32_t reg)
         case 7: /* IEPSR */
             return xpsr_read(env) & 0x0700edff;
         case 8: /* MSP */
-            return get_msp(env);
+            return in_privileged_mode(env) ? get_msp(env) : 0;
         case NON_SECURE_REG(8): /* MSP_NS */
-            return env->v7m.other_ss_msp;
+            return in_privileged_mode(env) ? env->v7m.other_ss_msp : 0;
         case 9: /* PSP */
             return in_privileged_mode(env) ? get_psp(env) : 0;
         case NON_SECURE_REG(9): /* PSP_NS */
@@ -3915,25 +3916,42 @@ void HELPER(v7m_msr)(CPUState *env, uint32_t reg, uint32_t val)
             }
             break;
         case NON_SECURE_REG(8): /* MSP_NS */
+            if(!in_privileged_mode(env)) {
+                return;
+            }
             //  bits [1:0] of SP are WI or SBZP
             env->v7m.other_ss_msp = val & 0xFFFFFFFC;
             break;
         case 9: /* PSP */
+            if(!in_privileged_mode(env)) {
+                return;
+            }
             //  bits [1:0] of SP are WI or SBZP
             val &= 0xFFFFFFFC;
             set_psp(env, val);
             break;
         case NON_SECURE_REG(9): /* PSP_NS */
+            if(!in_privileged_mode(env)) {
+                return;
+            }
             //  bits [1:0] of SP are WI or SBZP
             env->v7m.other_ss_psp = val & 0xFFFFFFFC;
             break;
         case NON_SECURE_REG(10):
         case 10: /* MSPLIM - armv8-m specific */
-            env->v7m.msplim[is_secure] = val;
+            if(!in_privileged_mode(env)) {
+                return;
+            }
+            //  bits [2:0] of the limit are RES0, and so is the Non-secure limit without the Main Extension
+            env->v7m.msplim[is_secure] = is_secure || !arm_feature(env, ARM_FEATURE_V8M_BASELINE) ? val & ~7 : 0;
             break;
         case NON_SECURE_REG(11):
         case 11: /* PSPLIM - armv8-m specific */
-            env->v7m.psplim[is_secure] = val;
+            if(!in_privileged_mode(env)) {
+                return;
+            }
+            //  bits [2:0] of the limit are RES0, and so is the Non-secure limit without the Main Extension
+            env->v7m.psplim[is_secure] = is_secure || !arm_feature(env, ARM_FEATURE_V8M_BASELINE) ? val & ~7 : 0;
             break;
         case NON_SECURE_REG(16):
         case 16: /* PRIMASK */
