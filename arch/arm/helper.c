@@ -1043,6 +1043,10 @@ static inline int v7m_load_helper(CPUState *env, uint32_t address, uint32_t *val
 
 static int v7m_push(CPUState *env, uint32_t val)
 {
+    /* Stack() uses the privilege of the mode PushStack() sampled before the exception was activated
+     * (Armv8-M ARM DDI0553B.r, E2.1.387 and E2.1.328). */
+    tlib_assert(env->v7m.exception_phase == V7M_EXCEPTION_PHASE_STACKING);
+
     uint32_t address = env->regs[13] - 4;
     /* PushStack() allocates the complete frame even if a stacking access
      * faults. Rule RQSSB permits abandoning the remaining memory accesses and
@@ -1051,7 +1055,7 @@ static int v7m_push(CPUState *env, uint32_t val)
     if(env->v7m.exception_phase_fault != 0) {
         return 1;
     }
-    return v7m_store_helper(env, address, val, ARM_M_AT_STACK, !in_privileged_mode(env), env->secure);
+    return v7m_store_helper(env, address, val, ARM_M_AT_STACK, env->v7m.stacking_is_user, env->secure);
 }
 
 static uint32_t v7m_pop(CPUState *env)
@@ -1706,7 +1710,9 @@ void HELPER(fp_lsp)(CPUState *env)
     fp_lsp_create_context(env);
 }
 
-static inline void fpccr_update(CPUState *env, uint32_t frameptr, int original_exception)
+/* UpdateFPCCR(). `is_user` and `is_thread` describe the context that owns the FP state, which on exception
+ * entry is the interrupted context, not the exception being entered. */
+static inline void fpccr_update(CPUState *env, uint32_t frameptr, int original_exception, bool is_user, bool is_thread)
 {
     bool is_secure = env->secure;
     /* Set address of the FP frame on the stack */
@@ -1719,8 +1725,8 @@ static inline void fpccr_update(CPUState *env, uint32_t frameptr, int original_e
 
     /* Update fields to information about the current CPU state */
     env->v7m.fpccr[M_REG_COMMON] = FIELD_DP32(env->v7m.fpccr[M_REG_COMMON], V7M_FPCCR, S, is_secure);
-    env->v7m.fpccr[is_secure] = FIELD_DP32(env->v7m.fpccr[is_secure], V7M_FPCCR, USER, in_user_mode(env));
-    env->v7m.fpccr[is_secure] = FIELD_DP32(env->v7m.fpccr[is_secure], V7M_FPCCR, THREAD, !in_handler_mode(env));
+    env->v7m.fpccr[is_secure] = FIELD_DP32(env->v7m.fpccr[is_secure], V7M_FPCCR, USER, is_user);
+    env->v7m.fpccr[is_secure] = FIELD_DP32(env->v7m.fpccr[is_secure], V7M_FPCCR, THREAD, is_thread);
 
     /* UpdateFPCCR() snapshots whether every fault class could have preempted
      * the context owning this FP state. The NVIC model acknowledges an exception
@@ -1930,6 +1936,13 @@ static int v7m_prepare_exception_taken(CPUState *env, uint32_t *lr, bool secure_
     return stack_status;
 }
 
+/* Whether the context that an EXC_RETURN value returns to is unprivileged */
+static bool v7m_exc_return_is_user(CPUState *env, uint32_t exc_return)
+{
+    bool return_to_secure = env->v7m.has_trustzone ? (exc_return & ARM_EXC_RETURN_S_MASK) != 0 : env->secure;
+    return (exc_return & ARM_EXC_RETURN_MODE_MASK) && FIELD_EX32(env->v7m.control[return_to_secure], V7M_CONTROL, nPRIV);
+}
+
 static void v7m_clear_active_fp_state_on_exception_entry(CPUState *env)
 {
     /* ActivateException() clears both unbanked active FP state fields on
@@ -2034,6 +2047,12 @@ static void do_interrupt_v7m(CPUState *env)
         }
     }
 
+    /* PushStack() samples CurrentMode() before the exception is activated, and Stack() makes the stacking
+     * accesses unprivileged in Thread mode with CONTROL.nPRIV set (Armv8-M ARM DDI0553B.r, E2.1.328 and
+     * E2.1.387). PushCalleeStack() takes the mode from EXC_RETURN when tail-chaining (E2.1.327). */
+    env->v7m.stacking_is_user = exception_return_tailchain ? v7m_exc_return_is_user(env, exception_return_type)
+                                                           : !in_privileged_mode(env);
+
     /* Set Mode field to the current execution mode
      * 0 - handler mode
      * 1 - thread mode
@@ -2098,7 +2117,8 @@ static void do_interrupt_v7m(CPUState *env)
             if(fpccr_read(env, env->secure) & ARM_FPCCR_LSPEN_MASK) {
                 /* Set lazy FP state preservation  */
                 env->regs[13] -= fp_get_reservation_size(env);
-                fpccr_update(env, env->regs[13], acknowledged_exception);
+                fpccr_update(env, env->regs[13], acknowledged_exception, env->v7m.stacking_is_user,
+                             lr & ARM_EXC_RETURN_MODE_MASK);
             } else {
                 if(~env->vfp.xregs[ARM_VFP_FPEXC] & ARM_VFP_FPEXC_FPUEN_MASK) {
                     /* FPU is disabled, revert SP and raise Usage Fault  */
@@ -2250,7 +2270,12 @@ static void do_interrupt_v7m(CPUState *env)
         tlib_assert(vector_fault_result == V7M_SYNCHRONOUS_FAULT_REPLACED);
         v7m_acknowledge_replacement_exception(env, &active_exception, &secure_target);
         if(env->v7m.has_trustzone) {
+            /* ExceptionTaken() for the replacement is a tail-chain: PushCalleeStack() pushes with the
+             * privilege of the mode in EXC_RETURN (Armv8-M ARM DDI0553B.r, E2.1.327). */
+            env->v7m.exception_phase = V7M_EXCEPTION_PHASE_STACKING;
+            env->v7m.stacking_is_user = v7m_exc_return_is_user(env, lr);
             v7m_prepare_exception_taken(env, &lr, secure_target, true);
+            env->v7m.exception_phase = V7M_EXCEPTION_PHASE_NONE;
             env->v7m.exception_phase_fault = 0;
             switch_v7m_security_state(env, secure_target);
         }
@@ -5160,7 +5185,7 @@ void HELPER(v8m_vlstm)(CPUState *env, uint32_t address)
     if((env->v7m.fpccr[M_REG_COMMON] & ARM_FPCCR_LSPEN_MASK) > 0) {
         /* If Lazy preservation is enabled, just update the FPCCR and FPCAR
          * Low three bits are RES0 */
-        fpccr_update(env, address, 0);
+        fpccr_update(env, address, 0, in_user_mode(env), !in_handler_mode(env));
     } else {
         if(!is_aligned(address, 8)) {
             env->exception_index = EXCP_UNALIGNED;

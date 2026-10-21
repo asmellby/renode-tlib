@@ -403,6 +403,8 @@ typedef struct CPUState {
          * EXC_RETURN as a tail-chain instead of pushing another frame. */
         bool exception_return_tailchain;
         uint32_t exception_return_type;
+        /* Privilege of the context whose state is being stacked on exception entry. */
+        bool stacking_is_user;
         bool locked_up;
         //  Exception return can only happen from a special set of instructions,
         //  described in RKPSS and RHPFG. This field specifies whether we just
