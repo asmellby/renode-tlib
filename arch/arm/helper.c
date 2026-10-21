@@ -3991,8 +3991,13 @@ void HELPER(v7m_msr)(CPUState *env, uint32_t reg, uint32_t val)
                 return;
             }
 
-            env->v7m.control[is_secure] &= ~3;
-            env->v7m.control[is_secure] |= val & 3;
+            env->v7m.control[is_secure] &= ~1;
+            env->v7m.control[is_secure] |= val & 1;
+            /* ARMv7-M ignores writes to SPSEL in Handler mode, ARMv8-M does not */
+            if(arm_feature(env, ARM_FEATURE_V8) || !in_handler_mode(env)) {
+                env->v7m.control[is_secure] &= ~2;
+                env->v7m.control[is_secure] |= val & 2;
+            }
             if(is_secure || env->v7m.nsacr & ARM_NSACR_CP10_MASK) {
                 env->v7m.control[M_REG_COMMON] &= ~ARM_CONTROL_FPCA_MASK;
                 env->v7m.control[M_REG_COMMON] |= val & ARM_CONTROL_FPCA_MASK;
