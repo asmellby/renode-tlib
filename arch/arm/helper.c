@@ -1555,6 +1555,13 @@ uint32_t ccr_read(CPUState *env, bool is_secure)
     if(!is_secure) {
         value &= ~FIELD_MASK(V7M_CCR, TRD);
     }
+    /* Bits [9] (STKALIGN in ARMv7-M) and [0] (NONBASETHRDENA in ARMv7-M) are RES1 in Armv8-M (Armv8-M ARM
+     * DDI0553B.r, D1.2.9). ARMv7-M lets software clear STKALIGN to stack exception frames 4-byte aligned, which
+     * tlib does not implement: it always aligns them to 8 bytes, so STKALIGN reads as 1 there too. */
+    value |= FIELD_MASK(V7M_CCR, STKALIGN);
+    if(arm_feature(env, ARM_FEATURE_V8)) {
+        value |= FIELD_MASK(V7M_CCR, NONBASETHRDENA);
+    }
 
     return value;
 }
