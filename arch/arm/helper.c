@@ -2259,6 +2259,14 @@ static void do_interrupt_v7m(CPUState *env)
         env->regs[14] = lr;
     }
 
+    /* ExceptionTaken() activates the exception it takes, including the original exception taken with faults
+     * ignored before Lockup, and ActivateException() clears CONTROL.SPSEL of its Security state. An exception
+     * preempting the handler therefore records SP_main in EXC_RETURN.SPSEL (Armv8-M ARM DDI0553B.r, E2.1.14,
+     * E2.1.117 and E2.1.98; ARMv7-M ExceptionTaken() clears CONTROL.SPSEL too). This is done once the vector
+     * has been read, so a replacement exception taken after a vector fault still records the background
+     * SPSEL. */
+    env->v7m.control[env->secure] = FIELD_DP32(env->v7m.control[env->secure], V7M_CONTROL, SPSEL, 0);
+
     arm_announce_stack_change();
 }
 #endif
