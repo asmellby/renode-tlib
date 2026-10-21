@@ -2834,6 +2834,15 @@ static int get_phys_addr_mpu(CPUState *env, uint32_t address, int access_type, i
     tlib_printf(LOG_LEVEL_DEBUG, "MPU: Trying to access address 0x%X", address);
 #endif
 
+#ifdef TARGET_PROTO_ARM_M
+    /* Accesses to the PPB are not subject to an MPU check but use the default system address map (ARMv7-M,
+     * as Armv8-M ARM DDI0553B.r, rule TGQD). Unprivileged accesses that a PPB register does not permit are
+     * BusFaults, raised by get_phys_addr() before the MPU is consulted. */
+    if(address >= 0xE0000000 && address <= 0xE00FFFFF) {
+        return cortexm_check_default_mapping(address, prot, access_type);
+    }
+#endif
+
     for(n = env->number_of_mpu_regions - 1; n >= 0; n--) {
         if(!(env->cp15.c6_size_and_enable[n] & MPU_REGION_ENABLED_BIT)) {
             continue;
@@ -2891,16 +2900,7 @@ static int get_phys_addr_mpu(CPUState *env, uint32_t address, int access_type, i
 
     if(n < 0) {  //  background fault
         int background_result;
-#ifdef TARGET_PROTO_ARM_M
-        if(is_user && unlikely(env->v7m.ccr[env->secure] & FIELD_MASK(V7M_CCR, USERSETMPEND)) &&
-           tlib_nvic_is_stir_address(address)) {
-            *prot = PAGE_READ | PAGE_WRITE;
-            background_result = !(*prot & (1 << access_type));
-            //  Unlike other background faults, this one isn't bigger than a page
-            *page_size = 0;
-        } else
-#endif
-            if(arm_feature(env, ARM_FEATURE_PMSA)) {
+        if(arm_feature(env, ARM_FEATURE_PMSA)) {
             if(is_user || !(env->cp15.c1_sys & (1 << 17 /* BR, Background Region */))) {
                 background_result = MPU_BACKGROUND_FAULT;
             } else {
@@ -3326,7 +3326,12 @@ static inline int pmsav8_check_access_with_region(CPUState *env, uint32_t addres
     *prot = 0;
     *resolved_region = PMSA_MPU_REGION_INVALID;
 
-    if(!mpu_enabled) {
+    /* Accesses to the PPB are not subject to an MPU check but use the default system address map
+     * (Armv8-M ARM DDI0553B.r, rule TGQD). Unprivileged accesses that a PPB register does not permit
+     * are BusFaults, raised by get_phys_addr() before the MPU is consulted. */
+    bool ppb = address >= 0xE0000000 && address <= 0xE00FFFFF;
+
+    if(!mpu_enabled || ppb) {
         hit = false;
     } else {
         hit = pmsav8_get_region(env, address, secure, resolved_region, &multiple_regions, &applies_to_whole_page);
@@ -3362,7 +3367,7 @@ static inline int pmsav8_check_access_with_region(CPUState *env, uint32_t addres
          * - MPU disabled: for all accesses
          * - MPU enabled: for privileged accesses if default memory map is enabled (PRIVDEFENA)
          */
-        if(!mpu_enabled || (!is_user && MPU_PRIVDEFENA(env->pmsav8[secure].ctrl))) {
+        if(!mpu_enabled || ppb || (!is_user && MPU_PRIVDEFENA(env->pmsav8[secure].ctrl))) {
             *prot = cortexm_check_default_mapping_v8(address);
         } else {
             goto do_fault;
