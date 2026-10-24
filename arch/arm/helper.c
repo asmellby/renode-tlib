@@ -3302,7 +3302,8 @@ static inline void pmsav8_get_security_attribution(CPUState *env, uint32_t addre
         return;
     }
 
-    enum security_attribution idau_attribution;
+    /* An address the IDAU does not attribute is Secure */
+    enum security_attribution idau_attribution = SA_SECURE;
     if(unlikely(env->idau.custom_handler_enabled)) {
         ExternalIDAURequest request = { address, (int32_t)secure, access_type, access_width };
         *idau_valid = tlib_custom_idau_handler(&request, idau_region, &idau_attribution);

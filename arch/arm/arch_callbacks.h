@@ -25,7 +25,7 @@ void tlib_on_lockup_state_change(int32_t locked_up);
 uint32_t tlib_has_enabled_trustzone(void);
 uint32_t tlib_nvic_interrupt_targets_secure(int32_t no);
 uint32_t tlib_nvic_is_stir_address(uint32_t address);
-int32_t tlib_custom_idau_handler(void *external_idau_request, void *attribution, void *region);
+int32_t tlib_custom_idau_handler(void *external_idau_request, void *region, void *attribution);
 
 typedef struct {
     uint32_t address;
