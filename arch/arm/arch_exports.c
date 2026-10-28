@@ -909,7 +909,9 @@ EXC_VOID_2(tlib_set_pmsav8_ctrl, uint32_t, value, bool, secure)
 
 void tlib_set_pmsav8_rnr(uint32_t value, bool secure)
 {
-    guard_pmsav8(true);
+    /* MPU_RNR only selects the region accessed by MPU_RBAR and MPU_RLAR (Armv8-M ARM D1.2.174):
+     * writing it changes no memory attribution, so the TLB is kept. */
+    guard_pmsav8(false);
     if(value > MAX_MPU_REGIONS) {
         tlib_printf(LOG_LEVEL_ERROR, "Requested RNR value is greater than the maximum MPU regions");
         return;
